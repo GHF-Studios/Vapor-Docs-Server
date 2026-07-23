@@ -22,6 +22,21 @@ Expected public route behind the root reverse proxy:
 Owns uploaded/generated docs artifacts and docs version/current pointer
 metadata.
 
+## Initial routes
+
+```text
+GET  /healthz
+GET  /
+POST /v1/current
+GET  /v1/export
+```
+
+Protected routes expect:
+
+```text
+Authorization: Bearer <VAPOR_DOCS_ADMIN_TOKEN>
+```
+
 ## Non-goals
 
 - Steam/GitHub identity authority;
