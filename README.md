@@ -2,6 +2,8 @@
 
 Docs serving and docs publication service for Vapor.
 
+Initial implementation uses Axum/Tokio.
+
 ## Responsibility
 
 - serve current docs;

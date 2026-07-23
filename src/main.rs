@@ -1,247 +1,143 @@
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse};
+use axum::routing::{get, post};
+use axum::Router;
 use std::env;
-use std::fs;
-use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::fs;
+use tokio::net::TcpListener;
 
 const DEFAULT_BIND: &str = "127.0.0.1:7112";
 const DEFAULT_STATE_DIR: &str = "state/docs";
 const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Debug)]
-struct Request {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+#[derive(Clone)]
+struct AppState {
+    state_dir: Arc<PathBuf>,
+    admin_token: Option<String>,
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind = env::var("VAPOR_DOCS_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-    let state_dir = PathBuf::from(
-        env::var("VAPOR_DOCS_STATE").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string()),
-    );
-    fs::create_dir_all(state_dir.join("current"))?;
+    let state_dir =
+        PathBuf::from(env::var("VAPOR_DOCS_STATE").unwrap_or_else(|_| DEFAULT_STATE_DIR.into()));
+    fs::create_dir_all(state_dir.join("current")).await?;
 
-    let listener = TcpListener::bind(&bind)?;
+    let state = AppState {
+        state_dir: Arc::new(state_dir),
+        admin_token: env::var("VAPOR_DOCS_ADMIN_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty()),
+    };
+    let app = Router::new()
+        .route("/", get(serve_current_docs))
+        .route("/index.html", get(serve_current_docs))
+        .route("/healthz", get(healthz))
+        .route("/v1/current", post(upload_current_docs))
+        .route("/v1/export", get(export_docs))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .with_state(state);
+
+    let listener = TcpListener::bind(&bind).await?;
     eprintln!("vapor-docs-server listening on {bind}");
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                if let Err(error) = handle_connection(&mut stream, &state_dir) {
-                    eprintln!("request failed: {error}");
-                }
-            }
-            Err(error) => eprintln!("connection failed: {error}"),
-        }
-    }
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-fn handle_connection(stream: &mut TcpStream, state_dir: &Path) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let Some(request) = read_request(stream, MAX_UPLOAD_BYTES)? else {
-        return Ok(());
-    };
-
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/healthz") => respond_text(stream, "200 OK", "ok\n"),
-        ("GET", "/") | ("GET", "/index.html") => serve_current_docs(stream, state_dir),
-        ("POST", "/v1/current") => upload_current_docs(stream, state_dir, &request),
-        ("GET", "/v1/export") => export_docs(stream, state_dir, &request),
-        _ => respond_text(stream, "404 Not Found", "not found\n"),
-    }
+async fn healthz() -> &'static str {
+    "ok\n"
 }
 
-fn serve_current_docs(stream: &mut TcpStream, state_dir: &Path) -> io::Result<()> {
-    let index = state_dir.join("current").join("index.html");
-    let body = fs::read_to_string(index).unwrap_or_else(|_| {
+async fn serve_current_docs(State(state): State<AppState>) -> impl IntoResponse {
+    let index = state.state_dir.join("current").join("index.html");
+    let body = fs::read_to_string(index).await.unwrap_or_else(|_| {
         "<!doctype html><title>Vapor Docs</title><h1>Vapor Docs</h1><p>No docs have been published yet.</p>\n"
             .to_string()
     });
-    respond(
-        stream,
-        "200 OK",
-        "text/html; charset=utf-8",
-        body.as_bytes(),
+    Html(body)
+}
+
+async fn upload_current_docs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.admin_token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid admin token\n".to_string(),
+        );
+    }
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty docs upload\n".to_string());
+    }
+
+    let current = state.state_dir.join("current");
+    if let Err(error) = fs::create_dir_all(&current).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("docs: failed to create state directory: {error}\n"),
+        );
+    }
+    if let Err(error) = fs::write(current.join("index.html"), &body).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("docs: failed to write current docs: {error}\n"),
+        );
+    }
+
+    let metadata = format!(
+        "published_at_unix = {}\nbytes = {}\nformat = \"single-html\"\n",
+        unix_now(),
+        body.len()
+    );
+    if let Err(error) = fs::write(current.join("metadata.toml"), metadata).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("docs: failed to write metadata: {error}\n"),
+        );
+    }
+
+    (
+        StatusCode::CREATED,
+        "docs: current docs updated\n".to_string(),
     )
 }
 
-fn upload_current_docs(
-    stream: &mut TcpStream,
-    state_dir: &Path,
-    request: &Request,
-) -> io::Result<()> {
-    if !has_admin_token(request, "VAPOR_DOCS_ADMIN_TOKEN") {
-        return respond_text(
-            stream,
-            "401 Unauthorized",
-            "missing or invalid admin token\n",
-        );
-    }
-    if request.body.is_empty() {
-        return respond_text(stream, "400 Bad Request", "empty docs upload\n");
-    }
-
-    let current = state_dir.join("current");
-    fs::create_dir_all(&current)?;
-    fs::write(current.join("index.html"), &request.body)?;
-    fs::write(
-        current.join("metadata.toml"),
-        format!(
-            "published_at_unix = {}\nbytes = {}\nformat = \"single-html\"\n",
-            unix_now(),
-            request.body.len()
-        ),
-    )?;
-
-    respond_text(stream, "201 Created", "docs: current docs updated\n")
-}
-
-fn export_docs(stream: &mut TcpStream, state_dir: &Path, request: &Request) -> io::Result<()> {
-    if !has_admin_token(request, "VAPOR_DOCS_ADMIN_TOKEN") {
-        return respond_text(
-            stream,
-            "401 Unauthorized",
-            "missing or invalid admin token\n",
+async fn export_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&headers, &state.admin_token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid admin token\n".to_string(),
         );
     }
 
-    let metadata = state_dir.join("current").join("metadata.toml");
-    let index = state_dir.join("current").join("index.html");
-    let metadata = fs::read_to_string(metadata).unwrap_or_default();
-    let index = fs::read_to_string(index).unwrap_or_default();
+    let metadata = state.state_dir.join("current").join("metadata.toml");
+    let index = state.state_dir.join("current").join("index.html");
+    let metadata = fs::read_to_string(metadata).await.unwrap_or_default();
+    let index = fs::read_to_string(index).await.unwrap_or_default();
     let body = format!(
         "# Vapor docs export scaffold\n\n[metadata]\n{metadata}\n--- index.html ---\n{index}"
     );
 
-    respond(
-        stream,
-        "200 OK",
-        "text/plain; charset=utf-8",
-        body.as_bytes(),
-    )
+    (StatusCode::OK, body)
 }
 
-fn has_admin_token(request: &Request, env_name: &str) -> bool {
-    let Ok(expected) = env::var(env_name) else {
+fn authorized(headers: &HeaderMap, expected: &Option<String>) -> bool {
+    let Some(expected) = expected else {
         return false;
     };
-    if expected.is_empty() {
-        return false;
-    }
-
-    request
-        .headers
-        .iter()
-        .any(|(name, value)| name == "authorization" && value == &format!("Bearer {expected}"))
-}
-
-fn read_request(stream: &mut TcpStream, max_body: usize) -> io::Result<Option<Request>> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    let mut header_end = None;
-    let mut content_length = 0_usize;
-
-    loop {
-        let read = stream.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-
-        if header_end.is_none() {
-            header_end = find_header_end(&buffer);
-            if let Some(end) = header_end {
-                let headers = String::from_utf8_lossy(&buffer[..end]);
-                content_length = parse_content_length(&headers).unwrap_or(0);
-                if content_length > max_body {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "request body too large",
-                    ));
-                }
-            }
-        }
-
-        if let Some(end) = header_end {
-            if buffer.len() >= end + 4 + content_length {
-                break;
-            }
-        }
-    }
-
-    let Some(end) = header_end else {
-        return Ok(None);
-    };
-
-    let header_text = String::from_utf8_lossy(&buffer[..end]);
-    let mut lines = header_text.lines();
-    let Some(request_line) = lines.next() else {
-        return Ok(None);
-    };
-    let mut request_parts = request_line.split_whitespace();
-    let Some(method) = request_parts.next() else {
-        return Ok(None);
-    };
-    let Some(path) = request_parts.next() else {
-        return Ok(None);
-    };
-
-    let headers = lines
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
-        })
-        .collect();
-    let body_start = end + 4;
-    let body_end = body_start + content_length;
-    let body = buffer
-        .get(body_start..body_end)
-        .map_or_else(Vec::new, ToOwned::to_owned);
-
-    Ok(Some(Request {
-        method: method.to_string(),
-        path: path.to_string(),
-        headers,
-        body,
-    }))
-}
-
-fn find_header_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn parse_content_length(headers: &str) -> Option<usize> {
-    headers.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if name.trim().eq_ignore_ascii_case("content-length") {
-            value.trim().parse().ok()
-        } else {
-            None
-        }
-    })
-}
-
-fn respond_text(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
-    respond(stream, status, "text/plain; charset=utf-8", body.as_bytes())
-}
-
-fn respond(
-    stream: &mut TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &[u8],
-) -> io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )?;
-    stream.write_all(body)
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == format!("Bearer {expected}"))
 }
 
 fn unix_now() -> u64 {
