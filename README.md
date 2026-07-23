@@ -28,4 +28,3 @@ metadata.
 - diagnostics upload storage;
 - homepage/legal content ownership;
 - deployment orchestration.
-
