@@ -28,11 +28,15 @@ metadata.
 
 ```text
 GET  /healthz
+GET  /v1/status
 GET  /
 POST /v1/current
 POST /v1/current.tar.gz
 GET  /v1/export
 ```
+
+`GET /v1/status` is public and reports the current docs readiness, state path,
+upload limit, and temporary auth model. It must not expose tokens.
 
 `POST /v1/current` accepts a single HTML document for quick smoke tests.
 `POST /v1/current.tar.gz` accepts a gzip-compressed tar archive containing a

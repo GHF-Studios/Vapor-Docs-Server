@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", get(serve_current_docs))
         .route("/index.html", get(serve_current_docs))
         .route("/healthz", get(healthz))
+        .route("/v1/status", get(status))
         .route("/v1/current", post(upload_current_docs))
         .route("/v1/current.tar.gz", post(upload_current_docs_archive))
         .route("/v1/export", get(export_docs))
@@ -60,6 +61,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+async fn status(State(state): State<AppState>) -> impl IntoResponse {
+    let current_index_ready = fs::metadata(state.state_dir.join("current").join("index.html"))
+        .await
+        .is_ok_and(|metadata| metadata.is_file());
+    let metadata_ready = fs::metadata(state.state_dir.join("current").join("metadata.toml"))
+        .await
+        .is_ok_and(|metadata| metadata.is_file());
+    let body = format!(
+        "service = \"vapor-docs-server\"\nstate = \"{}\"\ncurrent_index_ready = {}\ncurrent_metadata_ready = {}\nmax_upload_bytes = {}\nauth_model = \"admin-token-scaffold\"\n",
+        state.state_dir.display(),
+        current_index_ready,
+        metadata_ready,
+        MAX_UPLOAD_BYTES
+    );
+    (StatusCode::OK, body)
 }
 
 async fn serve_current_docs(State(state): State<AppState>) -> impl IntoResponse {
